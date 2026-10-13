@@ -11,6 +11,8 @@
     const MIN_OBSERVE_TIME = 1500;
     const POSITION_TOLERANCE = 2;
     const CHECK_INTERVAL = 100;
+    const SCROLL_IDLE_TIME = 180;
+    const POSITION_ERROR_SETTLE_TIME = 250;
 
     const ALLOWED_TARGET_IDS = [
         "filterBarStickyArea",
@@ -46,7 +48,10 @@
     let rafId = null;
     let checkIntervalId = null;
     let timeoutId = null;
+    let delayedCheckTimeoutId = null;
     let stableSince = null;
+    let pendingCorrection = null;
+    let lastScrollActivityAt = 0;
     let correctionCount = 0;
 
     log("Script initialized.", {
@@ -207,6 +212,8 @@
             requiredStableTime: REQUIRED_STABLE_TIME,
             minObserveTime: MIN_OBSERVE_TIME,
             positionTolerance: POSITION_TOLERANCE,
+            scrollIdleTime: SCROLL_IDLE_TIME,
+            positionErrorSettleTime: POSITION_ERROR_SETTLE_TIME,
             manualOffset
         });
 
@@ -261,6 +268,7 @@
         }
 
         window.addEventListener("load", scheduleLoadCheck, { once: true });
+        window.addEventListener("scroll", scheduleScrollCheck, { passive: true });
         window.addEventListener("resize", scheduleResizeCheck, { passive: true });
         window.addEventListener("orientationchange", scheduleResizeCheck);
 
@@ -291,7 +299,13 @@
     }
 
     function scheduleResizeCheck() {
+        markScrollActivity();
         scheduleCheck("viewport-change");
+    }
+
+    function scheduleScrollCheck() {
+        markScrollActivity();
+        scheduleCheck("scroll-activity");
     }
 
     function scheduleCheck(reason) {
@@ -303,6 +317,18 @@
             rafId = null;
             checkPosition(reason);
         });
+    }
+
+    function scheduleDelayedCheck(reason, delay) {
+        if (!active || cancelled) {
+            return;
+        }
+
+        window.clearTimeout(delayedCheckTimeoutId);
+        delayedCheckTimeoutId = window.setTimeout(function () {
+            delayedCheckTimeoutId = null;
+            scheduleCheck(reason);
+        }, Math.max(0, delay));
     }
 
     function scheduleFrame(callback) {
@@ -320,6 +346,7 @@
         if (!target || !document.contains(target)) {
             target = document.getElementById(targetId);
             resetStability("target-replaced");
+            clearPendingCorrection("target-replaced");
 
             if (!target) {
                 if (elapsed() >= MAX_WAIT_TIME) {
@@ -346,18 +373,11 @@
         const positionError = Math.abs(currentTop - desiredTop);
 
         if (positionError > POSITION_TOLERANCE) {
-            log("Target position requires correction.", {
-                reason,
-                currentTop,
-                desiredTop,
-                positionError
-            });
-
-            resetStability("position-correction");
-            scrollToTarget("position-correction");
-            scheduleCheck("after-position-correction");
+            handlePositionError(reason, currentTop, desiredTop, positionError);
             return;
         }
+
+        clearPendingCorrection("position-within-tolerance");
 
         if (stableSince === null) {
             stableSince = now();
@@ -380,6 +400,64 @@
         }
     }
 
+    function handlePositionError(reason, currentTop, desiredTop, positionError) {
+        const currentTime = now();
+
+        resetStability("position-out-of-tolerance");
+
+        if (!pendingCorrection) {
+            pendingCorrection = {
+                firstDetectedAt: currentTime,
+                maxPositionError: positionError
+            };
+        } else {
+            pendingCorrection.maxPositionError = Math.max(
+                pendingCorrection.maxPositionError,
+                positionError
+            );
+        }
+
+        const pendingDuration = currentTime - pendingCorrection.firstDetectedAt;
+        const timeSinceScrollActivity = currentTime - lastScrollActivityAt;
+        const timeUntilScrollIdle = Math.max(
+            0,
+            SCROLL_IDLE_TIME - timeSinceScrollActivity
+        );
+        const timeUntilErrorSettled = Math.max(
+            0,
+            POSITION_ERROR_SETTLE_TIME - pendingDuration
+        );
+        const delay = Math.max(timeUntilScrollIdle, timeUntilErrorSettled);
+
+        if (delay > 0 && elapsed() + delay < MAX_WAIT_TIME) {
+            log("Position correction deferred.", {
+                reason,
+                currentTop,
+                desiredTop,
+                positionError,
+                pendingDuration,
+                timeSinceScrollActivity,
+                delay
+            });
+
+            scheduleDelayedCheck("deferred-position-correction", delay);
+            return;
+        }
+
+        log("Target position requires correction.", {
+            reason,
+            currentTop,
+            desiredTop,
+            positionError,
+            pendingDuration,
+            maxPositionError: pendingCorrection.maxPositionError
+        });
+
+        clearPendingCorrection("position-correction");
+        scrollToTarget("position-correction");
+        scheduleDelayedCheck("after-position-correction", SCROLL_IDLE_TIME);
+    }
+
     function scrollToTarget(reason) {
         if (!target) {
             warn("scrollToTarget was called without a valid target.");
@@ -393,6 +471,7 @@
             window.scrollY + currentTop - desiredTop
         );
 
+        markScrollActivity();
         correctionCount += 1;
 
         log("Scrolling to target.", {
@@ -523,6 +602,24 @@
         );
     }
 
+    function markScrollActivity() {
+        lastScrollActivityAt = now();
+    }
+
+    function clearPendingCorrection(reason) {
+        if (!pendingCorrection) {
+            return;
+        }
+
+        log("Pending position correction cleared.", {
+            reason,
+            pendingDuration: now() - pendingCorrection.firstDetectedAt,
+            maxPositionError: pendingCorrection.maxPositionError
+        });
+
+        pendingCorrection = null;
+    }
+
     function resetStability(reason) {
         if (stableSince === null) {
             return;
@@ -628,8 +725,10 @@
 
         window.clearInterval(checkIntervalId);
         window.clearTimeout(timeoutId);
+        window.clearTimeout(delayedCheckTimeoutId);
 
         window.removeEventListener("load", scheduleLoadCheck);
+        window.removeEventListener("scroll", scheduleScrollCheck);
         window.removeEventListener("resize", scheduleResizeCheck);
         window.removeEventListener("orientationchange", scheduleResizeCheck);
 

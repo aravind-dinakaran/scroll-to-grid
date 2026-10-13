@@ -5,6 +5,7 @@
     const TARGET_PARAM = "scrollToGridId";
     const DEBUG_PARAM = "scrollDebug";
     const OFFSET_PARAM = "scrollToGridOffset";
+    const ADJUST_DELAY_PARAM = "scrollToGridAdjustDelay";
 
     const MAX_WAIT_TIME = 10000;
     const REQUIRED_STABLE_TIME = 900;
@@ -13,6 +14,16 @@
     const CHECK_INTERVAL = 100;
     const SCROLL_IDLE_TIME = 180;
     const POSITION_ERROR_SETTLE_TIME = 250;
+    // Wait after the first jump so sticky/floating PLP chrome can finish
+    // animating before corrective scrolls start fighting it.
+    const DEFAULT_POST_INITIAL_SCROLL_DELAY = 600;
+
+    // Academy next-gen header slides in on upward scroll via #headerForScroll
+    // inside #nextGenHeader240. Always reserve its settled height, but never
+    // chase the slide-in animation as a live sticky offset.
+    const FLOATING_HEADER_ID = "nextGenHeader240";
+    const FLOATING_HEADER_SCROLL_ID = "headerForScroll";
+    const FLOATING_HEADER_HEIGHT = 248;
 
     const ALLOWED_TARGET_IDS = [
         "filterBarStickyArea",
@@ -36,6 +47,7 @@
     const DEBUG = params.get(DEBUG_PARAM) === "true";
     const targetId = getRequestedTargetId();
     const manualOffset = getManualOffset();
+    const postInitialScrollDelay = getPostInitialScrollDelay();
     const startTime = now();
 
     let active = false;
@@ -49,15 +61,19 @@
     let checkIntervalId = null;
     let timeoutId = null;
     let delayedCheckTimeoutId = null;
+    let adjustDelayTimeoutId = null;
     let stableSince = null;
     let pendingCorrection = null;
     let lastScrollActivityAt = 0;
     let correctionCount = 0;
+    let initialScrollCompletedAt = null;
+    let adjustmentsEnabled = false;
 
     log("Script initialized.", {
         url: window.location.href,
         targetId,
-        debugEnabled: DEBUG
+        debugEnabled: DEBUG,
+        postInitialScrollDelay
     });
 
     if (!targetId) {
@@ -138,6 +154,26 @@
         return Math.max(0, parsedOffset);
     }
 
+    function getPostInitialScrollDelay() {
+        const rawDelay = params.get(ADJUST_DELAY_PARAM);
+
+        if (rawDelay === null) {
+            return DEFAULT_POST_INITIAL_SCROLL_DELAY;
+        }
+
+        const parsedDelay = Number(rawDelay);
+
+        if (!Number.isFinite(parsedDelay) || parsedDelay < 0) {
+            warn("Ignoring invalid post-initial scroll adjust delay.", {
+                rawDelay,
+                fallback: DEFAULT_POST_INITIAL_SCROLL_DELAY
+            });
+            return DEFAULT_POST_INITIAL_SCROLL_DELAY;
+        }
+
+        return parsedDelay;
+    }
+
     function waitForTarget() {
         target = document.getElementById(targetId);
 
@@ -214,15 +250,64 @@
             positionTolerance: POSITION_TOLERANCE,
             scrollIdleTime: SCROLL_IDLE_TIME,
             positionErrorSettleTime: POSITION_ERROR_SETTLE_TIME,
+            postInitialScrollDelay,
             manualOffset
         });
 
         scrollToTarget("initial-scroll");
-        scheduleCheck("after-initial-scroll");
+        beginPostInitialScrollDelay();
+    }
+
+    function beginPostInitialScrollDelay() {
+        initialScrollCompletedAt = now();
+        adjustmentsEnabled = postInitialScrollDelay <= 0;
+
+        if (adjustmentsEnabled) {
+            log("Post-initial scroll delay skipped; adjustments enabled immediately.");
+            scheduleCheck("after-initial-scroll");
+            return;
+        }
+
+        log("Deferring scroll adjustments after initial scroll.", {
+            postInitialScrollDelay
+        });
+
+        window.clearTimeout(adjustDelayTimeoutId);
+        adjustDelayTimeoutId = window.setTimeout(function () {
+            adjustDelayTimeoutId = null;
+
+            if (!active || cancelled) {
+                return;
+            }
+
+            adjustmentsEnabled = true;
+            clearPendingCorrection("post-initial-scroll-delay-elapsed");
+            resetStability("post-initial-scroll-delay-elapsed");
+
+            log("Post-initial scroll delay elapsed; enabling adjustments.", {
+                postInitialScrollDelay,
+                elapsedTime: elapsed()
+            });
+
+            scheduleCheck("after-post-initial-scroll-delay");
+        }, postInitialScrollDelay);
+    }
+
+    function getRemainingPostInitialScrollDelay() {
+        if (adjustmentsEnabled || initialScrollCompletedAt === null) {
+            return 0;
+        }
+
+        const waited = now() - initialScrollCompletedAt;
+        return Math.max(0, postInitialScrollDelay - waited);
     }
 
     function observeLayoutChanges() {
-        mutationObserver = new MutationObserver(function () {
+        mutationObserver = new MutationObserver(function (mutations) {
+            if (areFloatingHeaderOnlyMutations(mutations)) {
+                return;
+            }
+
             scheduleCheck("dom-mutation");
         });
 
@@ -232,7 +317,11 @@
         });
 
         if ("ResizeObserver" in window) {
-            resizeObserver = new ResizeObserver(function () {
+            resizeObserver = new ResizeObserver(function (entries) {
+                if (areFloatingHeaderOnlyResizeEntries(entries)) {
+                    return;
+                }
+
                 scheduleCheck("resize");
             });
 
@@ -248,7 +337,11 @@
             try {
                 layoutShiftObserver = new PerformanceObserver(function (entryList) {
                     const hasLayoutShift = entryList.getEntries().some(function (entry) {
-                        return !entry.hadRecentInput;
+                        if (entry.hadRecentInput) {
+                            return false;
+                        }
+
+                        return !isFloatingHeaderOnlyLayoutShift(entry);
                     });
 
                     if (!hasLayoutShift) {
@@ -371,6 +464,26 @@
         const desiredTop = getDesiredViewportTop(target);
         const currentTop = target.getBoundingClientRect().top;
         const positionError = Math.abs(currentTop - desiredTop);
+        const remainingPostInitialDelay = getRemainingPostInitialScrollDelay();
+
+        if (remainingPostInitialDelay > 0) {
+            // Observe layout, but do not treat the target as stable until the
+            // floating/sticky chrome has had time to settle after the jump.
+            if (positionError > POSITION_TOLERANCE) {
+                handlePositionError(reason, currentTop, desiredTop, positionError);
+            } else {
+                scheduleDelayedCheck(
+                    "waiting-for-post-initial-scroll-delay",
+                    remainingPostInitialDelay
+                );
+            }
+
+            if (elapsed() >= MAX_WAIT_TIME) {
+                finalCorrection("stabilization-timeout");
+            }
+
+            return;
+        }
 
         if (positionError > POSITION_TOLERANCE) {
             handlePositionError(reason, currentTop, desiredTop, positionError);
@@ -402,8 +515,25 @@
 
     function handlePositionError(reason, currentTop, desiredTop, positionError) {
         const currentTime = now();
+        const remainingPostInitialDelay = getRemainingPostInitialScrollDelay();
 
         resetStability("position-out-of-tolerance");
+
+        if (remainingPostInitialDelay > 0) {
+            log("Position correction held for post-initial scroll delay.", {
+                reason,
+                currentTop,
+                desiredTop,
+                positionError,
+                remainingPostInitialDelay
+            });
+
+            scheduleDelayedCheck(
+                "waiting-for-post-initial-scroll-delay",
+                remainingPostInitialDelay
+            );
+            return;
+        }
 
         if (!pendingCorrection) {
             pendingCorrection = {
@@ -491,6 +621,9 @@
     }
 
     function finalCorrection(reason) {
+        // Allow the timeout path to correct even if the post-initial delay
+        // has not fully elapsed, so we still land on target before cleanup.
+        adjustmentsEnabled = true;
         scrollToTarget("final-" + reason);
         cleanup(reason);
     }
@@ -516,7 +649,14 @@
 
     function getStickyOffset(scrollTarget) {
         const candidates = getStickyOffsetCandidates();
-        const ranges = [];
+        // Always reserve the settled floating-header band. Do not measure the
+        // live header rect, or its slide-in animation will keep shifting offset.
+        const ranges = [
+            {
+                top: 0,
+                bottom: FLOATING_HEADER_HEIGHT
+            }
+        ];
 
         candidates.forEach(function (element) {
             if (
@@ -559,6 +699,7 @@
 
         log("Calculated sticky viewport offset.", {
             offset,
+            floatingHeaderHeight: FLOATING_HEADER_HEIGHT,
             candidateCount: candidates.length
         });
 
@@ -595,7 +736,92 @@
         return candidates;
     }
 
+    function getFloatingHeaderElement() {
+        return document.getElementById(FLOATING_HEADER_ID);
+    }
+
+    function isFloatingHeaderRelated(node) {
+        if (!node) {
+            return false;
+        }
+
+        const element =
+            node.nodeType === 1 ? node : node.parentElement || null;
+
+        if (!element) {
+            return false;
+        }
+
+        if (
+            element.id === FLOATING_HEADER_ID ||
+            element.id === FLOATING_HEADER_SCROLL_ID
+        ) {
+            return true;
+        }
+
+        const header = getFloatingHeaderElement();
+        if (header && header.contains(element)) {
+            return true;
+        }
+
+        const scrollHeader = document.getElementById(FLOATING_HEADER_SCROLL_ID);
+        return Boolean(scrollHeader && scrollHeader.contains(element));
+    }
+
+    function areFloatingHeaderOnlyMutations(mutations) {
+        if (!mutations || !mutations.length) {
+            return false;
+        }
+
+        return Array.prototype.every.call(mutations, function (mutation) {
+            if (!isFloatingHeaderRelated(mutation.target)) {
+                return false;
+            }
+
+            const relatedNodes = [];
+
+            Array.prototype.forEach.call(mutation.addedNodes || [], function (node) {
+                relatedNodes.push(node);
+            });
+            Array.prototype.forEach.call(mutation.removedNodes || [], function (node) {
+                relatedNodes.push(node);
+            });
+
+            if (!relatedNodes.length) {
+                return true;
+            }
+
+            return relatedNodes.every(function (node) {
+                return isFloatingHeaderRelated(node);
+            });
+        });
+    }
+
+    function areFloatingHeaderOnlyResizeEntries(entries) {
+        if (!entries || !entries.length) {
+            return false;
+        }
+
+        return Array.prototype.every.call(entries, function (entry) {
+            return isFloatingHeaderRelated(entry.target);
+        });
+    }
+
+    function isFloatingHeaderOnlyLayoutShift(entry) {
+        if (!entry || !entry.sources || !entry.sources.length) {
+            return false;
+        }
+
+        return entry.sources.every(function (source) {
+            return isFloatingHeaderRelated(source.node);
+        });
+    }
+
     function shouldIgnoreOffsetElement(scrollTarget, element) {
+        if (isFloatingHeaderRelated(element)) {
+            return true;
+        }
+
         return (
             scrollTarget.id === "filterBarStickyArea" &&
             scrollTarget.contains(element)
@@ -726,6 +952,7 @@
         window.clearInterval(checkIntervalId);
         window.clearTimeout(timeoutId);
         window.clearTimeout(delayedCheckTimeoutId);
+        window.clearTimeout(adjustDelayTimeoutId);
 
         window.removeEventListener("load", scheduleLoadCheck);
         window.removeEventListener("scroll", scheduleScrollCheck);
